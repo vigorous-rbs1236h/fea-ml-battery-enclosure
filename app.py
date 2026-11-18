@@ -1,25 +1,92 @@
-%%writefile app.py
-import joblib
+import os
+import re
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
 
 st.set_page_config(page_title="EV Battery Enclosure Optimizer", page_icon="🔋", layout="wide")
 
-@st.cache_resource
-def load_model():
-    return joblib.load('surrogate_model.pkl')
 
-@st.cache_data
-def load_data():
-    return pd.read_csv('fea_results.csv'), pd.read_csv('fea_benchmarks.csv')
+def clean_num(val):
+    if pd.isna(val):
+        return np.nan
+    if isinstance(val, (int, float)):
+        return float(val)
+    match = re.search(r'[-+]?\d*\.?\d+', str(val).strip())
+    return float(match.group()) if match else np.nan
+
+
+@st.cache_resource
+def load_pipeline_and_data(excel_path='data.xlsx'):
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"'{excel_path}' not found in repository root.")
+
+    raw = pd.read_excel(excel_path, header=None)
+    records = []
+
+    blocks = [
+        ('Lateral', '6061-T6', range(12, 21), 2),
+        ('Lateral', '5052-H32', range(23, 32), 2),
+        ('Transverse', '6061-T6', range(12, 21), 11),
+        ('Transverse', '5052-H32', range(23, 32), 11),
+    ]
+
+    for pattern, material, row_indices, start_col in blocks:
+        for r in row_indices:
+            mass = clean_num(raw.iloc[r, start_col])
+            if pd.isna(mass):
+                continue
+            records.append({
+                'Rib_Pattern': pattern,
+                'Material': material,
+                'Num_Ribs': int(clean_num(raw.iloc[r, start_col + 1])),
+                'Rib_Thickness_mm': clean_num(raw.iloc[r, start_col + 2]),
+                'Rib_Height_mm': clean_num(raw.iloc[r, start_col + 3]),
+                'Mass_kg': mass,
+                'Max_Von_Mises_MPa': clean_num(raw.iloc[r, start_col + 4]),
+                'Max_Deformation_mm': clean_num(raw.iloc[r, start_col + 5]),
+            })
+
+    benchmarks = [
+        {'Rib_Pattern': 'Without Ribs', 'Material': '6061-T6', 'Num_Ribs': 0, 'Rib_Thickness_mm': 0.0, 'Rib_Height_mm': 0.0,
+         'Mass_kg': clean_num(raw.iloc[1, 2]), 'Max_Von_Mises_MPa': clean_num(raw.iloc[1, 3]), 'Max_Deformation_mm': clean_num(raw.iloc[1, 4])},
+        {'Rib_Pattern': 'Without Ribs', 'Material': '5052-H32', 'Num_Ribs': 0, 'Rib_Thickness_mm': 0.0, 'Rib_Height_mm': 0.0,
+         'Mass_kg': clean_num(raw.iloc[3, 2]), 'Max_Von_Mises_MPa': clean_num(raw.iloc[3, 3]), 'Max_Deformation_mm': clean_num(raw.iloc[3, 4])},
+    ]
+
+    df_main = pd.DataFrame(records)
+    df_bench = pd.DataFrame(benchmarks)
+
+    X = df_main[['Rib_Pattern', 'Material', 'Num_Ribs', 'Rib_Thickness_mm', 'Rib_Height_mm']]
+    y = df_main[['Mass_kg', 'Max_Von_Mises_MPa', 'Max_Deformation_mm']]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('cat', OneHotEncoder(drop='first', sparse_output=False), ['Rib_Pattern', 'Material'])
+        ],
+        remainder='passthrough'
+    )
+
+    model = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('regressor', MultiOutputRegressor(
+            GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.08, random_state=42)
+        ))
+    ])
+    model.fit(X, y)
+    return model, df_main, df_bench
+
 
 try:
-    model = load_model()
-    df, df_bench = load_data()
+    model, df, df_bench = load_pipeline_and_data('data.xlsx')
 except Exception as e:
-    st.error("⚠️ Missing dataset or model! Run 'prepare_data.py' and 'train_model.py' first.")
-    st.info(f"Details: {e}")
+    st.error(f"⚠️ Failed to initialize data or model: {e}")
     st.stop()
 
 st.title("⚡ EV Battery Pack Enclosure: ANSYS Surrogate Optimizer")
@@ -43,11 +110,9 @@ match selected_pattern:
     case "Lateral":
         pattern_title = "Lateral Rib Pattern (Longitudinal)"
         num_ribs = st.sidebar.slider("Number of Lateral Ribs", min_value=2, max_value=4, value=2, step=1)
-        pattern_notes = "2–4 longitudinal ribs along the tray span; all 7 ANSYS runs stay under 2.0 mm deformation."
     case "Transverse":
         pattern_title = "Transverse Rib Pattern (Cross-Width)"
         num_ribs = st.sidebar.slider("Number of Transverse Ribs", min_value=6, max_value=8, value=7, step=1)
-        pattern_notes = "6–8 cross-width ribs across the shorter baseplate axis."
     case _:
         st.error("Unsupported rib pattern selected.")
         st.stop()
@@ -159,7 +224,6 @@ fig = px.scatter(
     template="plotly_white"
 )
 
-# Green shaded region UNDER the safety line
 fig.add_hrect(
     y0=y_min,
     y1=SAFETY_LINE_MM,
@@ -171,7 +235,6 @@ fig.add_hrect(
     annotation_font=dict(color="green", size=13)
 )
 
-# Red shaded region ABOVE the safety line
 fig.add_hrect(
     y0=SAFETY_LINE_MM,
     y1=y_max,
@@ -183,7 +246,6 @@ fig.add_hrect(
     annotation_font=dict(color="red", size=13)
 )
 
-# Horizontal Safety Line
 fig.add_hline(
     y=SAFETY_LINE_MM,
     line_dash="dash",
@@ -194,7 +256,6 @@ fig.add_hline(
     annotation_font=dict(color="red", size=13)
 )
 
-# Selected Model Star (Green if under line, Red if above line)
 fig.add_scatter(
     x=[pred_mass],
     y=[pred_def],
